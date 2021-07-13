@@ -16,6 +16,8 @@ from distutils.command import build
 from setuptools import setup
 from setuptools.command import develop
 
+from azure_functions_worker import __version__
+
 # The GitHub repository of the Azure Functions Host
 WEBHOST_GITHUB_API = "https://api.github.com/repos/Azure/azure-functions-host"
 WEBHOST_TAG_PREFIX = "v3."
@@ -71,7 +73,7 @@ NUGET_CONFIG = """\
     <add key="buildTools"
          value="https://www.myget.org/F/30de4ee06dd54956a82013fa17a3accb/" />
     <add key="AspNetVNext"
-         value="https://dotnet.myget.org/F/aspnetcore-dev/api/v3/index.json" />
+         value="https://www.myget.org/F/aspnetcore-dev/api/v3/index.json" />
   </packageSources>
 </configuration>
 """
@@ -163,6 +165,54 @@ class develop(develop.develop, BuildGRPC):
         super().run(*args, **kwargs)
 
 
+class extension(distutils.cmd.Command):
+    description = (
+        'Resolve WebJobs Extensions from AZURE_EXTENSIONS and NUGET_CONFIG.'
+    )
+    user_options = [
+        ('extensions-dir', None,
+         'A path to the directory where extension should be installed')
+    ]
+
+    def initialize_options(self):
+        self.extensions_dir = None
+
+    def finalize_options(self):
+        if self.extensions_dir is None:
+            self.extensions_dir = \
+                pathlib.Path(__file__).parent / 'build' / 'extensions'
+
+    def _install_extensions(self):
+        if not self.extensions_dir.exists():
+            os.makedirs(self.extensions_dir, exist_ok=True)
+
+        if not (self.extensions_dir / 'host.json').exists():
+            with open(self.extensions_dir / 'host.json', 'w') as f:
+                print('{}', file=f)
+
+        if not (self.extensions_dir / 'extensions.csproj').exists():
+            with open(self.extensions_dir / 'extensions.csproj', 'w') as f:
+                print(AZURE_EXTENSIONS, file=f)
+
+        with open(self.extensions_dir / 'NuGet.config', 'w') as f:
+            print(NUGET_CONFIG, file=f)
+
+        env = os.environ.copy()
+        env['TERM'] = 'xterm'  # ncurses 6.1 workaround
+        try:
+            subprocess.run(
+                args=['dotnet', 'build', '-o', '.'], check=True,
+                cwd=str(self.extensions_dir),
+                stdout=sys.stdout, stderr=sys.stderr, env=env)
+        except Exception:
+            print(".NET Core SDK is required to build the extensions. "
+                  "Please visit https://aka.ms/dotnet-download")
+            sys.exit(1)
+
+    def run(self):
+        self._install_extensions()
+
+
 class webhost(distutils.cmd.Command):
     description = 'Download and setup Azure Functions Web Host.'
     user_options = [
@@ -175,7 +225,6 @@ class webhost(distutils.cmd.Command):
     def initialize_options(self):
         self.webhost_version = None
         self.webhost_dir = None
-        self.extensions_dir = None
 
     def finalize_options(self):
         if self.webhost_version is None:
@@ -184,10 +233,6 @@ class webhost(distutils.cmd.Command):
         if self.webhost_dir is None:
             self.webhost_dir = \
                 pathlib.Path(__file__).parent / 'build' / 'webhost'
-
-        if self.extensions_dir is None:
-            self.extensions_dir = \
-                pathlib.Path(__file__).parent / 'build' / 'extensions'
 
     def _get_webhost_version(self) -> str:
         # Return the latest matched version (e.g. 3.0.15278)
@@ -294,33 +339,6 @@ class webhost(distutils.cmd.Command):
 
         print('Functions Host is compiled successfully')
 
-    def _install_extensions(self):
-        if not self.extensions_dir.exists():
-            os.makedirs(self.extensions_dir, exist_ok=True)
-
-        if not (self.extensions_dir / 'host.json').exists():
-            with open(self.extensions_dir / 'host.json', 'w') as f:
-                print('{}', file=f)
-
-        if not (self.extensions_dir / 'extensions.csproj').exists():
-            with open(self.extensions_dir / 'extensions.csproj', 'w') as f:
-                print(AZURE_EXTENSIONS, file=f)
-
-        with open(self.extensions_dir / 'NuGet.config', 'w') as f:
-            print(NUGET_CONFIG, file=f)
-
-        env = os.environ.copy()
-        env['TERM'] = 'xterm'  # ncurses 6.1 workaround
-        try:
-            subprocess.run(
-                args=['dotnet', 'build', '-o', '.'], check=True,
-                cwd=str(self.extensions_dir),
-                stdout=sys.stdout, stderr=sys.stderr, env=env)
-        except Exception:
-            print(".NET Core SDK is required to build the extensions. "
-                  "Please visit https://aka.ms/dotnet-download")
-            sys.exit(1)
-
     def run(self):
         # Prepare webhost
         zip_path = self._download_webhost_zip(self.webhost_version)
@@ -331,9 +349,6 @@ class webhost(distutils.cmd.Command):
         self._chmod_protobuf_generation_script(self.webhost_dir)
         self._compile_webhost(self.webhost_dir)
 
-        # Prepare extensions
-        self._install_extensions()
-
 
 with open("README.md") as readme:
     long_description = readme.read()
@@ -341,7 +356,7 @@ with open("README.md") as readme:
 
 setup(
     name='azure-functions-worker',
-    version='1.1.10',
+    version=__version__,
     description='Python Language Worker for Azure Functions Host',
     author="Microsoft Corp.",
     author_email="azurefunctions@microsoft.com",
@@ -369,6 +384,7 @@ setup(
               'azure_functions_worker.protos.identity',
               'azure_functions_worker.protos.shared',
               'azure_functions_worker.bindings',
+              'azure_functions_worker.bindings.shared_memory_data_transfer',
               'azure_functions_worker.utils',
               'azure_functions_worker._thirdparty'],
     install_requires=[
@@ -377,7 +393,7 @@ setup(
     ],
     extras_require={
         'dev': [
-            'azure-functions==1.6.0',
+            'azure-functions==1.7.2',
             'azure-eventhub~=5.1.0',
             'python-dateutil~=2.8.1',
             'flake8~=3.7.9',
@@ -390,14 +406,16 @@ setup(
             'pytest-xdist',
             'pytest-randomly',
             'pytest-instafail',
-            'pytest-rerunfailures'
+            'pytest-rerunfailures',
+            'ptvsd'
         ]
     },
     include_package_data=True,
     cmdclass={
-        'build': build,
         'develop': develop,
+        'build': build,
         'webhost': webhost,
+        'extension': extension
     },
     test_suite='tests'
 )

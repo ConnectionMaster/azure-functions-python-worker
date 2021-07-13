@@ -18,21 +18,25 @@ from typing import List, Optional
 
 import grpc
 
+from . import __version__
 from . import bindings
 from . import constants
 from . import functions
 from . import loader
 from . import protos
-from .constants import (CONSOLE_LOG_PREFIX, PYTHON_THREADPOOL_THREAD_COUNT,
+from .constants import (PYTHON_THREADPOOL_THREAD_COUNT,
                         PYTHON_THREADPOOL_THREAD_COUNT_DEFAULT,
                         PYTHON_THREADPOOL_THREAD_COUNT_MAX,
                         PYTHON_THREADPOOL_THREAD_COUNT_MIN)
 from .logging import disable_console_logging, enable_console_logging
-from .logging import error_logger, is_system_log_category, logger
+from .logging import (logger, error_logger, is_system_log_category,
+                      CONSOLE_LOG_PREFIX)
+from .extension import ExtensionManager
 from .utils.common import get_app_setting
 from .utils.tracing import marshall_exception_trace
 from .utils.dependency import DependencyManager
 from .utils.wrappers import disable_feature_by
+from .bindings.shared_memory_data_transfer import SharedMemoryManager
 
 _TRUE = "true"
 
@@ -71,6 +75,7 @@ class Dispatcher(metaclass=DispatcherMeta):
         self._request_id = request_id
         self._worker_id = worker_id
         self._functions = functions.Registry()
+        self._shmem_mgr = SharedMemoryManager()
 
         self._old_task_factory = None
 
@@ -253,18 +258,24 @@ class Dispatcher(metaclass=DispatcherMeta):
         self._grpc_resp_queue.put_nowait(resp)
 
     async def _handle__worker_init_request(self, req):
-        logger.info('Received WorkerInitRequest, request ID %s',
-                    self.request_id)
+        logger.info('Received WorkerInitRequest, '
+                    'python version %s, worker version %s, request ID %s',
+                    sys.version, __version__, self.request_id)
 
         capabilities = {
             constants.RAW_HTTP_BODY_BYTES: _TRUE,
             constants.TYPED_DATA_COLLECTION: _TRUE,
             constants.RPC_HTTP_BODY_ONLY: _TRUE,
+            constants.WORKER_STATUS: _TRUE,
             constants.RPC_HTTP_TRIGGER_METADATA_REMOVED: _TRUE,
+            constants.SHARED_MEMORY_DATA_TRANSFER: _TRUE,
         }
 
-        # Can detech worker packages
-        DependencyManager.use_customer_dependencies()
+        # Can detech worker packages only when customer's code is present
+        # This only works in dedicated and premium sku.
+        # The consumption sku will switch on environment_reload request.
+        if not DependencyManager.is_in_linux_consumption():
+            DependencyManager.prioritize_customer_dependencies()
 
         return protos.StreamingMessage(
             request_id=self.request_id,
@@ -273,13 +284,23 @@ class Dispatcher(metaclass=DispatcherMeta):
                 result=protos.StatusResult(
                     status=protos.StatusResult.Success)))
 
+    async def _handle__worker_status_request(self, req):
+        # Logging is not necessary in this request since the response is used
+        # for host to judge scale decisions of out-of-proc languages.
+        # Having log here will reduce the responsiveness of the worker.
+        return protos.StreamingMessage(
+            request_id=req.request_id,
+            worker_status_response=protos.WorkerStatusResponse())
+
     async def _handle__function_load_request(self, req):
         func_request = req.function_load_request
         function_id = func_request.function_id
+        function_name = func_request.metadata.name
 
         logger.info(f'Received FunctionLoadRequest, '
                     f'request ID: {self.request_id}, '
-                    f'function ID: {function_id}')
+                    f'function ID: {function_id}'
+                    f'function Name: {function_name}')
         try:
             func = loader.load_function(
                 func_request.metadata.name,
@@ -290,9 +311,15 @@ class Dispatcher(metaclass=DispatcherMeta):
             self._functions.add_function(
                 function_id, func, func_request.metadata)
 
+            ExtensionManager.function_load_extension(
+                function_name,
+                func_request.metadata.directory
+            )
+
             logger.info('Successfully processed FunctionLoadRequest, '
                         f'request ID: {self.request_id}, '
-                        f'function ID: {function_id}')
+                        f'function ID: {function_id},'
+                        f'function Name: {function_name}')
 
             return protos.StreamingMessage(
                 request_id=self.request_id,
@@ -351,25 +378,31 @@ class Dispatcher(metaclass=DispatcherMeta):
                     trigger_metadata = invoc_request.trigger_metadata
                 else:
                     trigger_metadata = None
-                args[pb.name] = bindings.from_incoming_proto(
-                    pb_type_info.binding_name, pb.data,
-                    trigger_metadata=trigger_metadata,
-                    pytype=pb_type_info.pytype)
 
+                args[pb.name] = bindings.from_incoming_proto(
+                    pb_type_info.binding_name, pb,
+                    trigger_metadata=trigger_metadata,
+                    pytype=pb_type_info.pytype,
+                    shmem_mgr=self._shmem_mgr)
+
+            fi_context = bindings.Context(
+                fi.name, fi.directory, invocation_id, trace_context)
             if fi.requires_context:
-                args['context'] = bindings.Context(
-                    fi.name, fi.directory, invocation_id, trace_context)
+                args['context'] = fi_context
 
             if fi.output_types:
                 for name in fi.output_types:
                     args[name] = bindings.Out()
 
             if fi.is_async:
-                call_result = await fi.func(**args)
+                call_result = await self._run_async_func(
+                    fi_context, fi.func, args
+                )
             else:
                 call_result = await self._loop.run_in_executor(
                     self._sync_call_tp,
-                    self.__run_sync_func, invocation_id, fi.func, args)
+                    self._run_sync_func,
+                    invocation_id, fi_context, fi.func, args)
             if call_result is not None and not fi.has_return:
                 raise RuntimeError(f'function {fi.name!r} without a $return '
                                    'binding returned a non-None value')
@@ -383,15 +416,11 @@ class Dispatcher(metaclass=DispatcherMeta):
                         # Can "None" be marshaled into protos.TypedData?
                         continue
 
-                    rpc_val = bindings.to_outgoing_proto(
+                    param_binding = bindings.to_outgoing_param_binding(
                         out_type_info.binding_name, val,
-                        pytype=out_type_info.pytype)
-                    assert rpc_val is not None
-
-                    output_data.append(
-                        protos.ParameterBinding(
-                            name=out_name,
-                            data=rpc_val))
+                        pytype=out_type_info.pytype,
+                        out_name=out_name, shmem_mgr=self._shmem_mgr)
+                    output_data.append(param_binding)
 
             return_value = None
             if fi.return_type is not None:
@@ -454,7 +483,7 @@ class Dispatcher(metaclass=DispatcherMeta):
             )
 
             # Reload azure google namespaces
-            DependencyManager.reload_azure_google_namespace(
+            DependencyManager.reload_customer_libraries(
                 func_env_reload_request.function_app_directory
             )
 
@@ -481,6 +510,35 @@ class Dispatcher(metaclass=DispatcherMeta):
             return protos.StreamingMessage(
                 request_id=self.request_id,
                 function_environment_reload_response=failure_response)
+
+    async def _handle__close_shared_memory_resources_request(self, req):
+        """
+        Frees any memory maps that were produced as output for a given
+        invocation.
+        This is called after the functions host is done reading the output from
+        the worker and wants the worker to free up those resources.
+        """
+        close_request = req.close_shared_memory_resources_request
+        map_names = close_request.map_names
+        # Assign default value of False to all result values.
+        # If we are successfully able to close a memory map, its result will be
+        # set to True.
+        results = {mem_map_name: False for mem_map_name in map_names}
+
+        try:
+            for mem_map_name in map_names:
+                try:
+                    success = self._shmem_mgr.free_mem_map(mem_map_name)
+                    results[mem_map_name] = success
+                except Exception as e:
+                    logger.error(f'Cannot free memory map {mem_map_name} - {e}',
+                                 exc_info=True)
+        finally:
+            response = protos.CloseSharedMemoryResourcesResponse(
+                close_map_results=results)
+            return protos.StreamingMessage(
+                request_id=self.request_id,
+                close_shared_memory_resources_response=response)
 
     @disable_feature_by(constants.PYTHON_ROLLBACK_CWD_PATH)
     def _change_cwd(self, new_cwd: str):
@@ -540,14 +598,20 @@ class Dispatcher(metaclass=DispatcherMeta):
             max_workers=max_worker
         )
 
-    def __run_sync_func(self, invocation_id, func, params):
+    def _run_sync_func(self, invocation_id, context, func, params):
         # This helper exists because we need to access the current
         # invocation_id from ThreadPoolExecutor's threads.
         _invocation_id_local.v = invocation_id
         try:
-            return func(**params)
+            return ExtensionManager.get_sync_invocation_wrapper(context,
+                                                                func)(params)
         finally:
             _invocation_id_local.v = None
+
+    async def _run_async_func(self, context, func, params):
+        return await ExtensionManager.get_async_invocation_wrapper(
+            context, func, params
+        )
 
     def __poll_grpc(self):
         options = []
