@@ -39,6 +39,8 @@ extends:
       image: 1es-windows-2022
       os: windows
     sdl:
+      codeql:
+        excludePathPatterns: '/deps'
       codeSignValidation:
         enabled: true
         break: true
