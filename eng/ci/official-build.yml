@@ -40,7 +40,8 @@ extends:
       os: windows
     sdl:
       codeql:
-        excludePathPatterns: '/deps'
+        # Exclude dependencies from CodeQL analysis
+        excludePathPatterns: '/deps,/build'
       codeSignValidation:
         enabled: true
         break: true
