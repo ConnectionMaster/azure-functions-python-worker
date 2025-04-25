@@ -1,6 +1,5 @@
 import sys
 import os
-from azure_functions_worker import main
 
 
 # Azure environment variables
@@ -16,4 +15,10 @@ def add_script_root_to_sys_path():
 
 if __name__ == '__main__':
     add_script_root_to_sys_path()
-    main.main()
+    minor_version = sys.version_info[1]
+    if minor_version < 13:
+        from azure_functions_worker import main
+        main.main()
+    else:
+        from proxy_worker import start_worker
+        start_worker.start()

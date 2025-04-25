@@ -63,6 +63,15 @@ jobs:
           SQL_CONNECTION: $(LinuxSqlConnectionString312)
           EVENTGRID_URI: $(LinuxEventGridTopicUriString312)
           EVENTGRID_CONNECTION: $(LinuxEventGridConnectionKeyString312)
+        Python313:
+          PYTHON_VERSION: '3.13'
+          STORAGE_CONNECTION: $(LinuxStorageConnectionString312)
+          COSMOSDB_CONNECTION: $(LinuxCosmosDBConnectionString312)
+          EVENTHUB_CONNECTION: $(LinuxEventHubConnectionString312)
+          SERVICEBUS_CONNECTION: $(LinuxServiceBusConnectionString312)
+          SQL_CONNECTION: $(LinuxSqlConnectionString312)
+          EVENTGRID_URI: $(LinuxEventGridTopicUriString312)
+          EVENTGRID_CONNECTION: $(LinuxEventGridConnectionKeyString312)
     steps:
       - task: UsePythonVersion@0
         inputs:
@@ -120,7 +129,14 @@ jobs:
           Write-Host "pipelineVarSet: $pipelineVarSet"
           $branch = "$(Build.SourceBranch)"
           Write-Host "Branch: $branch"
-          if($branch.StartsWith("refs/heads/sdk/") -or $pipelineVarSet -eq "true")
+          
+          $PY_VER = "$(PYTHON_VERSION)"
+          Write-Host "Python version: $PY_VER"
+          # Extract minor version as integers
+          $PY_MINO = "${PY_VER#*.}"
+          Write-Host "Branch: PY_MINOR"
+
+          if($branch.StartsWith("refs/heads/sdk/") -or $pipelineVarSet -eq "true" -or $PY_MINOR -ge 13 )
           {
             Write-Host "##vso[task.setvariable variable=skipTest;]true"
           }
@@ -129,7 +145,6 @@ jobs:
             Write-Host "##vso[task.setvariable variable=skipTest;]false"
           }
         displayName: 'Set skipTest variable'
-        condition: or(eq(variables.isSdkRelease, true), eq(variables['USETESTPYTHONSDK'], true))
       - powershell: |
           Write-Host "skipTest: $(skipTest)"
         displayName: 'Display skipTest variable'
@@ -145,4 +160,5 @@ jobs:
           AzureWebJobsEventGridTopicUri: $(EVENTGRID_URI)
           AzureWebJobsEventGridConnectionKey: $(EVENTGRID_CONNECTION)
           skipTest: $(skipTest)
+          PYAZURE_WEBHOST_DEBUG: true
         displayName: "Running $(PYTHON_VERSION) Python E2E Tests"
