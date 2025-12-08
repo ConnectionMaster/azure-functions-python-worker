@@ -57,9 +57,9 @@ jobs:
   dependsOn: ['CheckGitHubRelease']
   displayName: 'PyPI Package'
   steps:
-  - script: |
-      echo "##vso[task.setvariable variable=BranchName]refs/heads/${{ parameters.BRANCH_NAME }}/$(NewLibraryVersion)"
-    displayName: 'Set branch variable'
+  - powershell: |
+      Write-Host "##vso[task.setvariable variable=BranchName]refs/heads/${{ parameters.BRANCH_NAME }}/$(NewWorkerVersion)"
+    displayName: "Set branch variable"
   - powershell: |
         Write-Host "BranchName: $(BranchName)"
     displayName: 'Display BranchName variable'  
@@ -74,13 +74,13 @@ jobs:
       branchName: '$(BranchName)'
       allowPartiallySucceededBuilds: true
       allowFailedBuilds: true
-      targetPath: '$(Pipeline.Workspace)/PythonWorkerArtifact'
+      targetPath: 'PythonRuntimeArtifact'
   - task: UsePythonVersion@0
     displayName: 'Use Python 3.13'
     inputs:
       versionSpec: 3.13
   - powershell: |
-      $newLibraryVersion = "$(NewLibraryVersion)"
+      $newLibraryVersion = "$(NewWorkerVersion)"
       $pypiToken = "$(PypiToken)"
       
       # Setup local Python environment
@@ -89,7 +89,7 @@ jobs:
       pip install twine
   
       # Publish artifacts to PyPi
-      twine upload --repository-url https://upload.pypi.org/legacy/ --username "__token__" --password "$pypiToken" PythonRuntimeArtifact/${{ parameters.PROJECT_DIRECTORY }}/dist/*
+      twine upload --repository-url https://upload.pypi.org/legacy/ --username "__token__" --password "$pypiToken" PythonRuntimeArtifact/${{ parameters.PROJECT_NAME }}/${{ parameters.PROJECT_DIRECTORY }}/dist/*
       Start-Sleep -Seconds 3
   
       # Checking if the new version is uploaded
