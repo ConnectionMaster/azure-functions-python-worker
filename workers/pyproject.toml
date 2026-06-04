@@ -79,6 +79,7 @@ dev = [
     "pre-commit",
     "invoke",
     "cryptography",
+    "pyjwt",
     "jsonpickle",
     "orjson"
 ]
