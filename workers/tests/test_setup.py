@@ -38,6 +38,12 @@ WEBHOST_GITHUB_API = "https://api.github.com/repos/Azure/azure-functions-host"
 WEBHOST_GIT_REPO = "https://github.com/Azure/azure-functions-host/archive"
 WEBHOST_TAG_PREFIX = "v4."
 WORKER_DIR = "azure_functions_worker" if sys.version_info.minor < 13 else "proxy_worker"
+# The worker's generated protobuf stubs must resolve `google.protobuf`
+# to the worker's vendored copy, not whatever the customer ships in
+# their `.python_packages`. The proxy worker (Python 3.13+) is a
+# separate worker with its own dependency isolation and is unaffected,
+# so we only rewrite for azure_functions_worker.
+REWRITE_PROTOBUF = WORKER_DIR == "azure_functions_worker"
 
 
 def get_webhost_version() -> str:
@@ -206,6 +212,10 @@ def copy_tree_merge(src, dst):
 
 
 def make_absolute_imports(compiled_files):
+    vendored_protobuf = (
+        f"{WORKER_DIR}._vendored.google.protobuf"
+    )
+
     for compiled in compiled_files:
         with open(compiled, "r+") as f:
             content = f.read()
@@ -226,6 +236,33 @@ def make_absolute_imports(compiled_files):
                 fr"from {WORKER_DIR}.protos.\g<1> \g<2>",
                 p1,
             )
+
+            if REWRITE_PROTOBUF:
+                # Redirect every `from google.protobuf[...] import ...`
+                # statement to the vendored copy. Anchored at line start
+                # (after a newline or at file start) so we don't touch
+                # string literals or comments.
+                p2 = re.sub(
+                    r"(?m)^from google\.protobuf"
+                    r"(?P<tail>(?:\.[A-Za-z0-9_.]+)?\s+import\b)",
+                    fr"from {vendored_protobuf}\g<tail>",
+                    p2,
+                )
+                # Redirect `import google.protobuf[.X]` statements. The
+                # generated stubs only emit the `from ...` form today,
+                # but be defensive in case future protoc output changes.
+                p2 = re.sub(
+                    r"(?m)^import google\.protobuf"
+                    r"(?P<sub>\.[A-Za-z0-9_.]+)?"
+                    r"(?P<asname>\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?$",
+                    lambda m: (
+                        f"import {vendored_protobuf}"
+                        f"{m.group('sub') or ''}"
+                        f"{m.group('asname') or ' as google_protobuf'}"
+                    ),
+                    p2,
+                )
+
             f.write(p2)
             f.truncate()
 
@@ -280,12 +317,67 @@ def extensions(c, clean=False, extensions_dir=None):
 
 
 @task
+def vendor_deps(c, target=None):
+    """Vendor third-party deps into azure_functions_worker._vendored.
+
+    Copies the currently-installed ``google.protobuf`` package into
+    ``azure_functions_worker/_vendored/google/protobuf/`` and rewrites its
+    internal imports so the worker resolves protobuf from the vendored copy
+    regardless of any version the customer ships in ``.python_packages``.
+    Safe to re-run; the script is idempotent.
+
+    Skipped for the proxy worker (Python >= 3.13) which has its own
+    dependency isolation and is unaffected by the protobuf shadowing issue.
+    """
+    if WORKER_DIR != "azure_functions_worker":
+        print(
+            f"Skipping vendor_deps for {WORKER_DIR} "
+            "(only required for the azure_functions_worker)."
+        )
+        return
+
+    # ROOT_DIR is the `workers/` directory (see top of file), so its parent
+    # is the repository root.
+    repo_root = ROOT_DIR.parent
+    script = repo_root / "eng" / "scripts" / "vendor_deps.py"
+    if not script.exists():
+        raise RuntimeError(
+            f"vendor_deps.py not found at {script}. "
+            "Expected it in eng/scripts/."
+        )
+
+    default_target = (
+        ROOT_DIR / "azure_functions_worker" / "_vendored"
+    )
+    target_path = pathlib.Path(target) if target else default_target
+
+    print(f"Vendoring google.protobuf into {target_path} ...")
+    try:
+        subprocess.check_call([
+            sys.executable, str(script),
+            "--target", str(target_path),
+            "--package", "google.protobuf",
+        ])
+    except subprocess.CalledProcessError as ex:
+        raise RuntimeError(
+            "vendor_deps.py failed. Ensure 'protobuf' is installed in the "
+            "current environment (pip install -e workers/[dev])."
+        ) from ex
+    print("Vendoring complete.")
+
+
+@task
 def build_protos(c, clean=False):
     """Build gRPC bindings."""
 
     if clean:
         shutil.rmtree(BUILD_DIR / 'protos')
         return
+    # Populate azure_functions_worker/_vendored/ before generating stubs.
+    # make_absolute_imports rewrites the generated *_pb2.py files to import
+    # from the vendored google.protobuf, so the vendored tree must exist
+    # before anything imports the freshly generated stubs.
+    vendor_deps(c)
     print("Generating gRPC bindings...")
     gen_grpc()
     print("gRPC bindings generated successfully.")

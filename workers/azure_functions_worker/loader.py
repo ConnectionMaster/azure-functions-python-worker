@@ -12,7 +12,11 @@ from datetime import timedelta
 from os import PathLike, fspath
 from typing import Dict, Optional
 
-from google.protobuf.duration_pb2 import Duration
+# Worker code references _vendored.google.protobuf instead of
+# importing directly from google.protobuf.
+from azure_functions_worker._vendored.google.protobuf.duration_pb2 import (
+    Duration,
+)
 
 from . import bindings, functions, protos
 from .bindings.retrycontext import RetryPolicy
