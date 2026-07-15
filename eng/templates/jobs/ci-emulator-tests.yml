@@ -44,7 +44,27 @@ jobs:
           echo "Disk space after cleanup:"
           df -h
         displayName: 'Free disk space'
-        
+
+      - bash: |
+          echo "Memory before cleanup:"
+          free -h
+
+          # Stop background services not needed for emulator tests.
+          # NOTE: Docker must remain running for CosmosDB/EventHub/ServiceBus emulators,
+          # so do NOT stop docker, docker.socket, or containerd here.
+          sudo systemctl stop snapd || true
+          sudo systemctl stop unattended-upgrades || true
+          sudo systemctl stop packagekit || true
+
+          # Drop Linux filesystem caches (page cache, dentries, inodes).
+          # This is safe for running processes, including Docker containers.
+          sudo sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' || true
+
+          echo "Memory after cleanup:"
+          free -h
+        displayName: 'Free memory'
+
       - task: UsePythonVersion@0
         inputs:
           versionSpec: $(PYTHON_VERSION)
