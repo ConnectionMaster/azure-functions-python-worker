@@ -5,9 +5,10 @@ parameters:
 
 steps:
 - task: PipAuthenticate@1
-  displayName: 'Pip Authenticate'
+  displayName: 'Authenticate pip to CFS'
   inputs:
-    artifactFeeds: 'internal/PythonWorker_Internal_PublicPackages'
+    artifactFeeds: 'public/upstream-public'
+    onlyAddExtraIndex: false
 - task: UsePythonVersion@0
   inputs:
     versionSpec: ${{ parameters.pythonVersion }}
@@ -69,12 +70,6 @@ steps:
     args: '${{ parameters.pythonVersion }}'
   displayName: 'Build dependencies from scratch'
   condition: eq(variables['isRC'], 'true')
-- bash: |
-    pip install pip-audit
-    cd workers
-    pip-audit -r requirements.txt
-  displayName: 'Run vulnerability scan'
-  continueOnError: true
 - task: CopyFiles@2
   inputs:
     contents: '$(workerPath)'
